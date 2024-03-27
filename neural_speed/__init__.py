@@ -169,8 +169,7 @@ class Model:
                exit(0)
         quant_bin = "{}/ne_{}_q_{}.bin".format(output_path, model_type, quant_desc)
 
-        if not use_quant:
-            self.bin_file = fp32_bin
+        if not use_quant:            self.bin_file = fp32_bin
         else:
             self.bin_file = quant_bin
 
@@ -484,4 +483,71 @@ class ModelServer:
     def Empty(self):
         return self.cpp_server.Empty()
 
-__all__ = ["get_cpp_module", "Model", "ModelServer"]
+
+class ModelForContBatching(Model):
+    def __init__(self,
+        ctx_size:int = 512,
+        n_batch:int = 512,
+        batch_size:int = 512,
+        max_batched_tokens:int = 512,
+        threads:int = 56,
+        repetition_penalty:float = 1.1,
+        num_beams:int = 4, # need to be greater than 1 for now since only beam search is supported
+        do_sample:bool = False,
+        top_k:int = 40,
+        top_p:float = 0.95,
+        temperature:float = 0.8,
+        length_penalty:float = 1.0,
+        early_stopping:bool = False,
+        n_keep:int = 0,
+        n_discard:int = -1,
+        shift_roped_k:bool = False,
+        pad_token:int = -1,
+        memory_dtype:str = "auto", # auto, fp16, fp32
+        scratch_size_ratio:float = None,
+        seed:int = 1234
+    ):
+        super().__init__()
+        self.generation_args = {}
+        self.generation_args["ctx_size"] = ctx_size
+        self.generation_args["n_batch"] = n_batch
+        self.generation_args["batch_size"] = batch_size
+        self.generation_args["max_batched_tokens"] = max_batched_tokens
+        self.generation_args["threads"] = threads
+        self.generation_args["repetition_penalty"] = repetition_penalty
+        self.generation_args["num_beams"] = num_beams
+        self.generation_args["do_sample"] = do_sample
+        self.generation_args["top_k"] = top_k
+        self.generation_args["top_p"] = top_p
+        self.generation_args["temperature"] = temperature
+        self.generation_args["length_penalty"] = length_penalty
+        self.generation_args["early_stopping"] = early_stopping
+        self.generation_args["n_keep"] = n_keep
+        self.generation_args["n_discard"] = n_discard
+        self.generation_args["shift_roped_k"] = shift_roped_k
+        self.generation_args["pad_token"] = pad_token
+        self.generation_args["memory_dtype"] = memory_dtype
+        self.generation_args["scratch_size_ratio"] = scratch_size_ratio
+        self.generation_args["seed"] = seed
+
+    # override base method
+    def __import_package__(self, model_type):
+        if self.module:
+            return
+        if model_type == "gptj":
+            import neural_speed.gptj_vllm_cb_cpp as cpp_model
+        elif model_type == "llama" or model_type == "llama2":
+            import neural_speed.llama_vllm_cb_cpp as cpp_model
+        else:
+            raise TypeError("Unsupported continuous batching model type {}!".format(model_type))
+        self.module = cpp_model
+
+    def load_model(self, **kwargs):
+        if self.model is None:
+            self.generation_args.update(kwargs)
+            self.init_from_bin(self.model_type,
+                               self.bin_file,
+                               **self.generation_args)
+            
+
+__all__ = ["get_cpp_module", "Model", "ModelServer", "ModelForContBatching"]

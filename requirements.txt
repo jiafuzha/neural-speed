@@ -13,7 +13,8 @@ py-cpuinfo
 sentencepiece
 setuptools>=61
 tiktoken
-torch
+torch==2.1.2+cpu; sys_platform == "linux"
+torch == 2.*;     sys_platform != "linux"
 transformers
 transformers_stream_generator
 zipfile38

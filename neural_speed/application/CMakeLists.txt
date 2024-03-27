@@ -145,3 +145,15 @@ compile_run(run_mixtral   main_run.cpp   main_pybind.cpp mixtral   llama)
 
 # speech recognition
 compile_run(run_whisper   audio_run.cpp  whisper_pybind.cpp whisper   whisper)
+
+# compile for vllm continuous batching
+function(compile_vllm_cont_batch MAIN_PY MODEL_NAME MODEL_LIB)
+  if ((NS_PYTHON_API) AND (NOT (MAIN_PY STREQUAL "") ))
+    pybind11_add_module("${MODEL_NAME}_vllm_cb_cpp" ${MAIN_PY})
+    target_link_libraries("${MODEL_NAME}_vllm_cb_cpp" PRIVATE ne_layers ${MODEL_LIB} common)
+    target_compile_definitions("${MODEL_NAME}_vllm_cb_cpp" PUBLIC -DMODEL_NAME="${MODEL_NAME}" -DMODEL_NAME_ID=${mymap_${MODEL_NAME}})
+  endif()
+endfunction()
+
+compile_vllm_cont_batch(vllm_cont_batch_pybind.cpp llama llama)
+compile_vllm_cont_batch(vllm_cont_batch_pybind.cpp gptj gptj)

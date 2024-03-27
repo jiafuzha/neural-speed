@@ -29,24 +29,30 @@ class TestModelServer(unittest.TestCase):
         shutil.rmtree("./runtime_outs", ignore_errors=True)
 
     def test_model_server(self):
-        prompts = [
-                "she opened the door and see",
-                "tell me 10 things about jazz music",
-                "What is the meaning of life?",
-                "To be, or not to be, that is the question: Whether 'tis nobler in the mind to suffer"\
-                " The slings and arrows of outrageous fortune, "\
-                "Or to take arms against a sea of troubles."\
-                "And by opposing end them. To die—to sleep,",
-                "Tell me an interesting fact about llamas.",
-                "What is the best way to cook a steak?",
-                "Are you familiar with the Special Theory of Relativity and can you explain it to me?",
-                "Recommend some interesting books to read.",
-                "What is the best way to learn a new language?",
-                "How to get a job at Intel?",
-                "If you could have any superpower, what would it be?",
-                "I want to learn how to play the piano.",
-                ]
-        model_name = "/tf_dataset2/models/nlp_toolkit/llama-2-7b-chat/Llama-2-7b-chat-hf"
+        # prompts = [
+        #         "she opened the door and see",
+        #         "tell me 10 things about jazz music",
+        #         "What is the meaning of life?",
+        #         "To be, or not to be, that is the question: Whether 'tis nobler in the mind to suffer"\
+        #         " The slings and arrows of outrageous fortune, "\
+        #         "Or to take arms against a sea of troubles."\
+        #         "And by opposing end them. To die—to sleep,",
+        #         "Tell me an interesting fact about llamas.",
+        #         "What is the best way to cook a steak?",
+        #         "Are you familiar with the Special Theory of Relativity and can you explain it to me?",
+        #         "Recommend some interesting books to read.",
+        #         "What is the best way to learn a new language?",
+        #         "How to get a job at Intel?",
+        #         "If you could have any superpower, what would it be?",
+        #         "I want to learn how to play the piano.",
+        #         ]
+        prompts = {
+                "she opened": 2,
+                "tell me": 1,
+                "What is": 3
+        }
+        # model_name = "/tf_dataset2/models/nlp_toolkit/llama-2-7b-chat/Llama-2-7b-chat-hf"
+        model_name = "meta-llama/Llama-2-7b-chat-hf"
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = Model()
         # get quantized model
@@ -100,8 +106,9 @@ class TestModelServer(unittest.TestCase):
                                 do_sample=False,
                                 continuous_batching=True,
                                 return_prompt=True,
-                                max_request_num=8,
-                                threads=56,
+                                # max_request_num=8,
+                                max_request_num=2,
+                                threads=1,
                                 print_log=False,
                                 scratch_size_ratio = 1.0,
                                 memory_dtype= md,

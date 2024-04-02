@@ -47,10 +47,13 @@ class TestModelServer(unittest.TestCase):
         #         "If you could have any superpower, what would it be?",
         #         "I want to learn how to play the piano.",
         #         ]
+        # prompts = {
+        #         "she opened": 2,
+        #         "tell me": 1,
+        #         "What is": 3
+        # }
         prompts = {
-                "she opened": 2,
-                "tell me": 1,
-                "What is": 3
+                "she opened": 4
         }
         # model_name = "/tf_dataset2/models/nlp_toolkit/llama-2-7b-chat/Llama-2-7b-chat-hf"
         model_name = "meta-llama/Llama-2-7b-chat-hf"

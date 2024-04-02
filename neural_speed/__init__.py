@@ -542,6 +542,9 @@ class ModelForContBatching(Model):
             raise TypeError("Unsupported continuous batching model type {}!".format(model_type))
         self.module = cpp_model
 
+    def get_cpp_module(self):
+        return self.module
+
     def load_model(self, **kwargs):
         if self.model is None:
             self.generation_args.update(kwargs)

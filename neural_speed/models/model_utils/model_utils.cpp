@@ -2469,7 +2469,7 @@ std::vector<std::tuple<int, int>> beam_search_flow::update_kv_cache_reorder_indi
 void beam_search_flow::update_status() {
   // check if done
   next_done_request_ids.clear();
-  for (int h = 0; h < beam_hypos.size(); ++h) {
+  for (int h = 0; h < beam_hypos.size(); ++h) { // TODO: stop looping at actual number of batch
     if (requests_done[h]) continue;
     const bool enough_new_tokens = (!cur_beams[h * beam_size].token_ids.empty() &&
                                     cur_beams[h * beam_size].token_ids.size() == gen_confs[h].max_new_tokens);

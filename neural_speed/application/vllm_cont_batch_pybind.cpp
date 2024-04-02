@@ -43,6 +43,7 @@
 #include "models/model_utils/model_utils.h"
 #include "models/model_utils/quant_utils.h"
 #include "models/model_utils/scheduler.h"
+#include "models/model_utils/pool.h"
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <signal.h>
@@ -158,7 +159,7 @@ class Model {
     if (ctx) model_free(ctx);
   }
 
-  void init_model(const std::string& model_path, int max_new_tokens, int n_batch, int ctx_size, int seed, int threads,
+  void init_model(ResponseCallback& callback, const std::string& model_path, int max_new_tokens, int n_batch, int ctx_size, int seed, int threads,
                   float repetition_penalty, int num_beams, bool do_sample, int top_k, float top_p, float temperature,
                   int min_new_tokens, float length_penalty, bool early_stopping, int n_keep, int n_discard,
                   bool shift_roped_k, int batch_size, int max_batched_tokens, model_vocab::id pad_token, const std::string& memory_dtype,
@@ -167,6 +168,8 @@ class Model {
   void reinit();
 
   std::vector<std::vector<model_token>> generate(const std::vector<std::vector<model_token>>& input_ids);
+
+  void Model::batch_beam_generate(const std::vector<Query>& new_queries);
 
   const std::vector<float>& evaluate_(const std::vector<std::vector<model_token>>& input_ids);
 
@@ -236,6 +239,22 @@ class Model {
     return bestla_quantize(src_w.mutable_data(), dst.mutable_data(), q_params, threads, src_w.shape(0), src_w.shape(1));
   }
 
+  static sequence Query2Sequence(const Query& query) {
+    sequence ret_seq;
+    ret_seq.request_idx = -1;  // let scheduler decides it
+    ret_seq.prompt_ids = query.token_ids;
+    ret_seq.n_prompt_tokens = query.token_ids.size();
+    ret_seq.n_tokens = query.token_ids.size();
+    ret_seq.n_past = 0;
+    ret_seq.n_total = 0;
+    ret_seq.gen_conf.max_new_tokens = query.max_new_tokens;
+    ret_seq.gen_conf.min_new_tokens = params.min_new_tokens;
+    ret_seq.gen_conf.length_penalty = params.length_penalty;
+    ret_seq.gen_conf.do_early_stopping = params.do_early_stopping;
+    ret_seq.query_id = query.id;
+    return ret_seq;
+  }
+
  private:
   model_context* ctx = nullptr;
   gpt_params params;
@@ -258,9 +277,19 @@ class Model {
                                                          const std::vector<model_input>& inputs, const int& n_threads);
   std::vector<model_token> post_sample_top_k_top_p_repeat(const float* logits);
   bool check_input_and_count_padding(const std::vector<std::vector<model_token>>& input_ids);
+
+  // ====NS support continuous batching, beam-search for now.
+  beam_search_flow* bsf = nullptr;
+  std::vector<sequence> running_seqs;
+  std::unordered_map<int, int> reqidx_to_vecid;
+  std::vector<int> request_done_ids;
+  ResponseCallback& response_callback;
+  bool prepare_batch_inputs(std::vector<sequence> *seqs, const int &n_input, model_input *inputs);
+  bool batch_step(std::vector<sequence> *seqs, const int &n);
+  bool batch_done();
 };
 
-void Model::init_model(const std::string& model_path, int max_new_tokens, int n_batch, int ctx_size, int seed,
+void Model::init_model(ResponseCallback& response_callback, const std::string& model_path, int max_new_tokens, int n_batch, int ctx_size, int seed,
                        int threads, float repetition_penalty, int num_beams, bool do_sample, int top_k, float top_p,
                        float temperature, int min_new_tokens, float length_penalty, bool early_stopping, int n_keep,
                        int n_discard, bool shift_roped_k, int batch_size, int max_batched_tokens, model_vocab::id pad_token,
@@ -284,6 +313,12 @@ void Model::init_model(const std::string& model_path, int max_new_tokens, int n_
     last_n_tokens[i].resize(n_ctx, 0);
   }
   if (pad_token != -1) ctx->vocab.pad_token_id = pad_token;
+
+  // ====NS support continuous batching, beam-search for now.
+  this->response_callback = response_callback;
+  if (ctx->beam_search && bsf == nullptr) {
+    bsf = new beam_search_flow(ctx, ctx->max_request_num, params.n_threads);
+  }
 }
 
 void Model::reinit() {
@@ -453,6 +488,152 @@ std::vector<std::vector<model_token>> Model::generate(const std::vector<std::vec
   }
   generate_count++;
   return ret_next_tokens;
+}
+
+bool Model::batch_done() {
+  return !request_done_ids.empty();
+}
+
+bool Model::prepare_batch_inputs(std::vector<sequence> *seqs, const int &n_input, model_input *inputs) {
+  for (int i = 0; i < n_input; ++i) {
+    if ((seqs->at(i)).status != seq_status::PREFILL && (seqs->at(i)).status != seq_status::DECODING) {
+      fprintf(stderr, "%s: error: request %d status is unright (%d).\n", __func__, seqs->at(i).request_idx,
+              static_cast<int>((seqs->at(i)).status));
+      return false;
+    } else if ((seqs->at(i)).status == seq_status::PREFILL) {
+      inputs[i].tokens = (seqs->at(i)).prompt_ids.data();
+      inputs[i].n_tokens = (seqs->at(i)).n_prompt_tokens;
+      inputs[i].n_prompt_tokens = (seqs->at(i)).n_prompt_tokens;
+      inputs[i].n_past = 0;
+      inputs[i].n_total = 0;
+      inputs[i].request_idx = (seqs->at(i)).request_idx;
+      // do not support padding for now
+      inputs[i].n_padding = 0;
+      inputs[i].gen_conf = (seqs->at(i)).gen_conf;
+    } else if ((seqs->at(i)).status == seq_status::DECODING) {
+      inputs[i].tokens = &(seqs->at(i)).generated_ids.back();
+      inputs[i].n_tokens = 1;
+      inputs[i].n_past = (seqs->at(i)).n_past;
+      inputs[i].n_total = (seqs->at(i)).n_total;
+      inputs[i].request_idx = (seqs->at(i)).request_idx;
+      // do not support padding for now
+      inputs[i].n_padding = 0;
+    } else {
+      continue;
+    }
+  }
+  return true;
+}
+
+bool Model::update_seqs(std::vector<sequence> *seqs, const int& n_input) {
+  request_done_ids.clear();
+  for (int ni = 0; ni < n_input; ++ni) {
+    if (seqs->at(ni).status == seq_status::PREFILL) {
+      seqs->at(ni).status = seq_status::DECODING;
+      seqs->at(ni).n_past = seqs->at(ni).n_prompt_tokens;
+      seqs->at(ni).n_total = seqs->at(ni).n_prompt_tokens;
+      seqs->at(ni).n_tokens = 1;
+    } else if (seqs->at(ni).status == seq_status::DECODING) {
+      seqs->at(ni).n_tokens = 1;
+      seqs->at(ni).n_past += seqs->at(ni).n_tokens;
+      seqs->at(ni).n_total += seqs->at(ni).n_tokens;
+    } else {
+      fprintf(stderr, "%s: error: wrong sequence status %d.\n", __func__, static_cast<int>(seqs->at(ni).status));
+      return false;
+    }
+  }
+  if (m_ctx->beam_search && bsf != nullptr) {
+    request_done_ids = bsf->request_done_ids();
+    std::vector<std::vector<model_token>> req_done_res = bsf->request_done_reponse();
+    if (request_done_ids.size() != req_done_res.size()) {
+      fprintf(stderr,
+              "%s: error: beam search give mis-matched size between finished request ids and generated "
+              "tokens.\n",
+              __func__);
+      return false;
+    }
+    for (int r = 0; r < request_done_ids.size(); ++r) {
+      const int idx = request_done_ids[r];
+      if (reqidx_to_vecid.count(idx) == 0) {
+        fprintf(stderr, "%s: error: done request idx: %d not in executed_seqs.\n", __func__, idx);
+        return false;
+      }
+      const int vecid = reqidx_to_vecid[idx];
+      seqs->at(vecid).generated_ids = std::move(req_done_res[r]);
+      seqs->at(vecid).status = seq_status::FINISHED;
+      seqs->at(vecid).end_time = model_time_us();
+    }
+    return true;
+  }
+  return false;  // TODO (YZT) greedy search and top_p-top_k sampling
+}
+
+bool Model::batch_step(std::vector<sequence> *seqs, const int &n) {
+  reqidx_to_vecid.clear();
+  for (int ni = 0; ni < seqs.size(); ++ni) {
+    reqidx_to_vecid.emplace(seqs->at(ni).request_idx, ni);
+  }
+
+  std::vector<model_input> step_inputs(n);
+  if (!prepare_batch_inputs(seqs, n, step_inputs.data())) {
+    return false;
+  }
+  if (!bsf->step(step_inputs)) {
+    return false;
+  }
+  return update_seqs(seqs, n);
+}
+
+void Model::batch_beam_generate(const std::vector<Query>& new_queries) {
+  if ((new_queries == nullptr || new_queries.empty()) && running_seqs.empty()) {
+    fprintf(stderr, "%s: error: no input\n", __func__);
+    return;
+  }
+  if (ctx->beam_search) {
+    std::vector<sequence> seqs;
+    seqs.reserve((new_queries == nullptr ? 0 : new_queries.size()) + running_seqs.size());
+    // add existing seqs
+    for (const auto& seq : running_seqs) {
+      seqs.push_back(seq);
+    }
+    for (const auto& query : new_queries) {
+      if (reqidx_to_vecid.find(query.id) != reqidx_to_vecid.end()) {
+        fprintf(stderr, "%s: error: request idx: %d already in executed_seqs.\n", __func__, query.id);
+        return;
+      }
+      seqs.push_back(Query2Sequence(query));
+    }
+
+    assert("number of request should not exceed max_request_num", seq.size() <= ctx->max_request_num);
+    
+    if (seqs.size() < ctx->max_request_num) { // execute one step
+      batch_step(&seqs, seqs.size());
+    } else { // execute multiple steps due to no slot
+      while (!batch_done()) {
+        batch_step(&seqs, seqs.size);
+      }
+    }
+    // callback to update vllm
+    if (!request_done_ids.empty()) {
+      std::vector<Query> done_queries(request_done_ids.size());
+      for (int r = 0; r < request_done_ids.size(); ++r) {
+        const int idx = request_done_ids[r];
+        if (reqidx_to_vecid.find(idx) == reqidx_to_vecid.end()) {
+          fprintf(stderr, "%s: error: done request idx: %d not in executed_seqs.\n", __func__, idx);
+          exit(0);
+        }
+        const int vecid = reqidx_to_vecid[idx];
+        done_queries.emplace_back(idx, seqs[vecid].generated_ids, seqs[vecid].gen_conf.max_new_tokens);
+        reqidx_to_vecid.erase(idx);
+        running_seqs.erase(running_seqs.begin() + vecid - (new_queries == nullptr ? 0 : new_queries.size()));
+        // TODO: clean kv cache
+      }
+      response_callback(done_queries, done_queries.size());
+    }
+    return;
+  }
+  fprintf(stderr, "\nERROR: Only beam search supported for now!\n");
+  exit(0);
 }
 
 std::vector<model_token> Model::post_greedy_search(const float* logits) {

@@ -484,7 +484,7 @@ class ModelServer:
         return self.cpp_server.Empty()
 
 
-class ModelForContBatching(Model):
+class ModelForContBatching:
     def __init__(self,
         ctx_size:int = 512,
         n_batch:int = 512,
@@ -507,7 +507,6 @@ class ModelForContBatching(Model):
         scratch_size_ratio:float = None,
         seed:int = 1234
     ):
-        super().__init__()
         self.generation_args = {}
         self.generation_args["ctx_size"] = ctx_size
         self.generation_args["n_batch"] = n_batch
@@ -530,9 +529,42 @@ class ModelForContBatching(Model):
         self.generation_args["scratch_size_ratio"] = scratch_size_ratio
         self.generation_args["seed"] = seed
 
-    # override base method
+        self.model_wrapper = Model()
+        self.model_type = None
+        self.config = None
+
+    def init(self,
+             model_name,
+             use_quant=True,
+             use_gptq=False,
+             use_awq=False,
+             use_autoround=False,
+             weight_dtype="int4",
+             alg="sym",
+             group_size=32,
+             scale_dtype="fp32",
+             compute_dtype="int8",
+             use_ggml=False,
+             model_hub="huggingface"):
+        from transformers import AutoConfig
+        self.config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        self.model_type = Model.get_model_type(self.config)
+        self.__import_package__(self.model_type)
+        self.model_wrapper.init(model_name,
+                        use_quant=use_quant,
+                        use_gptq=use_gptq,
+                        use_awq=use_awq,
+                        use_autoround=use_autoround,
+                        weight_dtype=weight_dtype,
+                        alg=alg,
+                        group_size=group_size,
+                        scale_dtype=scale_dtype,
+                        compute_dtype=compute_dtype,
+                        use_ggml=use_ggml,
+                        model_hub=model_hub)
+
     def __import_package__(self, model_type):
-        if self.module:
+        if self.model_wrapper.module:
             return
         if model_type == "gptj":
             import neural_speed.gptj_vllm_cb_cpp as cpp_model
@@ -540,17 +572,21 @@ class ModelForContBatching(Model):
             import neural_speed.llama_vllm_cb_cpp as cpp_model
         else:
             raise TypeError("Unsupported continuous batching model type {}!".format(model_type))
-        self.module = cpp_model
+        self.model_wrapper.module = cpp_model
 
     def get_cpp_module(self):
-        return self.module
+        return self.model_wrapper.module
 
     def load_model(self, **kwargs):
-        if self.model is None:
-            self.generation_args.update(kwargs)
-            self.init_from_bin(self.model_type,
-                               self.bin_file,
-                               **self.generation_args)
+        if self.model_wrapper is None:
+            raise ValueError("Please init model first.")
+        self.generation_args.update(kwargs)
+        self.model_wrapper.init_from_bin(self.model_type,
+                            self.model_wrapper.bin_file,
+                            **self.generation_args)
+
+    def __call__(self):
+        return self.model_wrapper.model.batch_beam_generate()
             
 
 __all__ = ["get_cpp_module", "Model", "ModelServer", "ModelForContBatching"]

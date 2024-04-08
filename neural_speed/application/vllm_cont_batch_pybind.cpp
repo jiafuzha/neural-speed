@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <memory>
 
 #include "common.h"
 #include "core/layers/bestla_common.hpp"
@@ -85,7 +86,10 @@ enum GenerationStatus {
   GENERATION_STATUS_WAITING = 1, // set after being converted to sequence
   GENERATION_STATUS_RUNNING = 2,
   GENERATION_STATUS_FINISHED = 3,
+  GENERATION_STATUS_CONSUMED = 4,
 };
+
+using namespace std;
 
 struct Generation {
   int query_id;
@@ -105,7 +109,7 @@ struct Generation {
     generated_ids = new int32_t[global_max_new_tokens];
   }
 
-  reset(GenerationStatus s) {
+  void reset(GenerationStatus s) {
     query_id = -1;
     n_prompt_tokens = 0;
     n_generated_tokens = 0;
@@ -125,21 +129,16 @@ struct Generation {
 class GenerationPool {
  public:
   GenerationPool(int pool_size, int n_prompt_ids, int n_new_tokens) : pool_size(pool_size), n_prompt_ids(n_prompt_ids), n_new_tokens(n_new_tokens) {
-    generations = new Generation[pool_size];
+    generations = static_cast<Generation*>(::operator new[](pool_size*sizeof(Generation)));
     for (int i = 0; i < pool_size; i++) {
-      generations[i] = new Generation(n_prompt_ids, n_new_tokens);
+      ::new (generations+i) Generation(n_prompt_ids, n_new_tokens);
     }
   }
 
   ~GenerationPool() {
-    for (int i = 0; i < pool_size; i++) {
-      delete generations[i];
-      generations[i] = nullptr;
-    }
-    delete generations;
+    delete[] generations;
     generations = nullptr;
     query_id_2_gen_id.clear();
-    generations.clear();
   }
 
   Generation* get_generations() {
@@ -166,7 +165,8 @@ class GenerationPool {
         return (unsigned long)occupy_slot(query_id, index);
       }
     }
-    return nullptr;
+    fprintf(stderr, "ERROR: %s, no slot available", __func__);
+    return 0;
   }
 
   void clear_generation_by_gen_id(int gen_id, GenerationStatus status) {
@@ -178,7 +178,7 @@ class GenerationPool {
 
   void clear_generation_by_query_id(int query_id, GenerationStatus status) {
     if (query_id_2_gen_id.find(query_id) == query_id_2_gen_id.end()) {
-      fprintf("ERROR: query_id %d not found in query_id_2_gen_id\n", query_id);
+      fprintf(stderr, "ERROR: %s, query_id %d not found in query_id_2_gen_id\n", __func__, query_id);
       return;
     }
     clear_generation_by_gen_id(query_id_2_gen_id[query_id], status);
@@ -197,7 +197,7 @@ class GenerationPool {
     return new_generation_ids;
   }
 
-  std::ordered_map<int, int>& get_query_id_2_gen_id() {
+  std::unordered_map<int, int>& get_query_id_2_gen_id() {
     return query_id_2_gen_id;
   }
 
@@ -221,7 +221,7 @@ class GenerationPool {
   int next_free_gen_id;
   Generation * generations;
   std::vector<int> new_generation_ids; // cleared after each batch_beam_generate
-  std::ordered_map<int, int> query_id_2_gen_id;
+  std::unordered_map<int, int> query_id_2_gen_id;
 };
 
 static std::set<model_archs> cont_batching_model_archs = {MODEL_GPTJ, MODEL_LLAMA};
@@ -306,13 +306,13 @@ class Model {
     if (generation_pool) delete generation_pool;
   }
 
-  void init_model(const std::string& model_path, ResponseCallback& response_callback, int max_new_tokens, int n_batch, int ctx_size, int seed, int threads,
+  void init_model(const std::string& model_path, int max_new_tokens, int n_batch, int ctx_size, int seed, int threads,
                   float repetition_penalty, int num_beams, bool do_sample, int top_k, float top_p, float temperature,
                   int min_new_tokens, float length_penalty, bool early_stopping, int n_keep, int n_discard,
                   bool shift_roped_k, int batch_size, int max_batched_tokens, model_vocab::id pad_token, const std::string& memory_dtype,
                   bool continuous_batching, const int& max_request_num, const float& scratch_size_ratio);
 
-  std::vector<int> batch_beam_generate();
+  std::optional<std::vector<int>> batch_beam_generate();
 
   unsigned long get_generations_address() { return generation_pool->get_generations_address(); }
 
@@ -337,41 +337,43 @@ class Model {
   // ====NS support continuous batching, beam-search for now.
   beam_search_flow* bsf = nullptr;
   std::vector<bool> free_req_idx;
-  std::vector<sequence> running_seqs;
+  std::vector<shared_ptr<sequence>> running_seqs;
   std::unordered_map<int, int> reqidx_to_vecid;
   std::vector<int> request_done_ids;
   // ResponseCallback response_callback;
-  bool prepare_batch_inputs(std::vector<sequence> *seqs, const int &n_input, model_input *inputs);
-  bool batch_step(std::vector<sequence> *seqs, const int &n);
+  bool prepare_batch_inputs(std::vector<shared_ptr<sequence>> *seqs, const int &n_input, model_input *inputs);
+  bool batch_step(std::vector<shared_ptr<sequence>> *seqs, const int &n);
   bool batch_done();
-  bool update_seqs(std::vector<sequence> *seqs, const int &n_input);
+  bool update_seqs(std::vector<shared_ptr<sequence>> *seqs, const int &n_input);
   int query_free_req_idx();
 
-  sequence Generation2Sequence(const Generation& g) {
-    sequence ret_seq;
-    ret_seq.request_idx = query_free_req_idx();
-    ret_seq.prompt_ids.assign(g.prompt_ids, g.prompt_ids + g.n_prompt_tokens);
-    ret_seq.n_prompt_tokens = g.n_prompt_tokens;
-    ret_seq.n_tokens = g.g.n_prompt_tokens;
-    ret_seq.n_past = 0;
-    ret_seq.n_total = 0;
-    ret_seq.gen_conf.max_new_tokens = g.max_new_tokens;
-    ret_seq.gen_conf.min_new_tokens = params.min_new_tokens;
-    ret_seq.gen_conf.length_penalty = params.length_penalty;
-    ret_seq.gen_conf.do_early_stopping = params.do_early_stopping;
-    ret_seq.query_id = g.query_id;
+  shared_ptr<sequence> generation2Sequence(Generation& g) {
+    shared_ptr<sequence> ret_seq = make_shared<sequence>();
+    ret_seq->request_idx = query_free_req_idx();
+    ret_seq->prompt_ids.assign(g.prompt_ids, g.prompt_ids + g.n_prompt_tokens);
+    ret_seq->n_prompt_tokens = g.n_prompt_tokens;
+    ret_seq->n_tokens = g.n_prompt_tokens;
+    ret_seq->n_past = 0;
+    ret_seq->n_total = 0;
+    ret_seq->gen_conf.max_new_tokens = g.max_new_tokens == 0 ? params.n_predict : g.max_new_tokens;
+    ret_seq->gen_conf.min_new_tokens = params.min_new_tokens;
+    ret_seq->gen_conf.length_penalty = params.length_penalty;
+    ret_seq->gen_conf.do_early_stopping = params.do_early_stopping;
+    ret_seq->query_id = g.query_id;
     g.status = GENERATION_STATUS_WAITING;
+    g.receive_time = model_time_us();
     return ret_seq;
   }
 
-  void updateGeneration(const sequence& seq, Generation* gs, int gen_id) {
+  void updateGeneration(const shared_ptr<sequence>& seq, Generation* gs, int gen_id) {
     Generation& g = gs[gen_id];
-    assert(("generation id should be the same as query id", g.query_id == seq.query_id));
-    int ret_size = seq.generated_ids.size();
+    assert(("generation id should be the same as query id", g.query_id == seq->query_id));
+    int ret_size = seq->generated_ids.size();
     g.n_generated_tokens = ret_size;
-    std::copy(seq.generated_ids.cbegin(), seq.generated_ids.cend(), ret_query.token_ids.begin());
+    std::copy(seq->generated_ids.cbegin(), seq->generated_ids.cend(), g.generated_ids);
     // reset generation
-    gs->mark_generation_done_by_query_id(g.query_id);
+    generation_pool->mark_generation_done_by_query_id(g.query_id);
+    g.end_time = model_time_us();
   }
 };
 
@@ -390,7 +392,7 @@ void Model::init_model(const std::string& model_path, int max_new_tokens, int n_
 
   // ====NS
   if (generation_pool == nullptr) {
-    generation_pool = new GenerationPool(max_request_num, ctx->cxt_size, ctx->max_new_tokens);
+    generation_pool = new GenerationPool(max_request_num, ctx->n_ctx, ctx->generation_conf.max_new_tokens);
   }
 
   // ====NS support continuous batching, beam-search for now.
@@ -415,28 +417,28 @@ bool Model::batch_done() {
   return !request_done_ids.empty();
 }
 
-bool Model::prepare_batch_inputs(std::vector<sequence> *seqs, const int &n_input, model_input *inputs) {
+bool Model::prepare_batch_inputs(std::vector<shared_ptr<sequence>> *seqs, const int &n_input, model_input *inputs) {
   for (int i = 0; i < n_input; ++i) {
-    if ((seqs->at(i)).status != seq_status::PREFILL && (seqs->at(i)).status != seq_status::DECODING) {
-      fprintf(stderr, "%s: error: request %d status is unright (%d).\n", __func__, seqs->at(i).request_idx,
-              static_cast<int>((seqs->at(i)).status));
+    if ((seqs->at(i))->status != seq_status::PREFILL && (seqs->at(i))->status != seq_status::DECODING) {
+      fprintf(stderr, "%s: error: request %d status is unright (%d).\n", __func__, seqs->at(i)->request_idx,
+              static_cast<int>((seqs->at(i))->status));
       return false;
-    } else if ((seqs->at(i)).status == seq_status::PREFILL) {
-      inputs[i].tokens = (seqs->at(i)).prompt_ids.data();
-      inputs[i].n_tokens = (seqs->at(i)).n_prompt_tokens;
-      inputs[i].n_prompt_tokens = (seqs->at(i)).n_prompt_tokens;
+    } else if ((seqs->at(i))->status == seq_status::PREFILL) {
+      inputs[i].tokens = (seqs->at(i))->prompt_ids.data();
+      inputs[i].n_tokens = (seqs->at(i))->n_prompt_tokens;
+      inputs[i].n_prompt_tokens = (seqs->at(i))->n_prompt_tokens;
       inputs[i].n_past = 0;
       inputs[i].n_total = 0;
-      inputs[i].request_idx = (seqs->at(i)).request_idx;
+      inputs[i].request_idx = (seqs->at(i))->request_idx;
       // do not support padding for now
       inputs[i].n_padding = 0;
-      inputs[i].gen_conf = (seqs->at(i)).gen_conf;
-    } else if ((seqs->at(i)).status == seq_status::DECODING) {
-      inputs[i].tokens = &(seqs->at(i)).generated_ids.back();
+      inputs[i].gen_conf = (seqs->at(i))->gen_conf;
+    } else if ((seqs->at(i))->status == seq_status::DECODING) {
+      inputs[i].tokens = &(seqs->at(i))->generated_ids.back();
       inputs[i].n_tokens = 1;
-      inputs[i].n_past = (seqs->at(i)).n_past;
-      inputs[i].n_total = (seqs->at(i)).n_total;
-      inputs[i].request_idx = (seqs->at(i)).request_idx;
+      inputs[i].n_past = (seqs->at(i))->n_past;
+      inputs[i].n_total = (seqs->at(i))->n_total;
+      inputs[i].request_idx = (seqs->at(i))->request_idx;
       // do not support padding for now
       inputs[i].n_padding = 0;
     } else {
@@ -446,20 +448,20 @@ bool Model::prepare_batch_inputs(std::vector<sequence> *seqs, const int &n_input
   return true;
 }
 
-bool Model::update_seqs(std::vector<sequence> *seqs, const int& n_input) {
+bool Model::update_seqs(std::vector<shared_ptr<sequence>> *seqs, const int& n_input) {
   request_done_ids.clear();
   for (int ni = 0; ni < n_input; ++ni) {
-    if (seqs->at(ni).status == seq_status::PREFILL) {
-      seqs->at(ni).status = seq_status::DECODING;
-      seqs->at(ni).n_past = seqs->at(ni).n_prompt_tokens;
-      seqs->at(ni).n_total = seqs->at(ni).n_prompt_tokens;
-      seqs->at(ni).n_tokens = 1;
-    } else if (seqs->at(ni).status == seq_status::DECODING) {
-      seqs->at(ni).n_tokens = 1;
-      seqs->at(ni).n_past += seqs->at(ni).n_tokens;
-      seqs->at(ni).n_total += seqs->at(ni).n_tokens;
+    if (seqs->at(ni)->status == seq_status::PREFILL) {
+      seqs->at(ni)->status = seq_status::DECODING;
+      seqs->at(ni)->n_past = seqs->at(ni)->n_prompt_tokens;
+      seqs->at(ni)->n_total = seqs->at(ni)->n_prompt_tokens;
+      seqs->at(ni)->n_tokens = 1;
+    } else if (seqs->at(ni)->status == seq_status::DECODING) {
+      seqs->at(ni)->n_tokens = 1;
+      seqs->at(ni)->n_past += seqs->at(ni)->n_tokens;
+      seqs->at(ni)->n_total += seqs->at(ni)->n_tokens;
     } else {
-      fprintf(stderr, "%s: error: wrong sequence status %d.\n", __func__, static_cast<int>(seqs->at(ni).status));
+      fprintf(stderr, "%s: error: wrong sequence status %d.\n", __func__, static_cast<int>(seqs->at(ni)->status));
       return false;
     }
   }
@@ -480,19 +482,19 @@ bool Model::update_seqs(std::vector<sequence> *seqs, const int& n_input) {
         return false;
       }
       const int vecid = reqidx_to_vecid[idx];
-      seqs->at(vecid).generated_ids = std::move(req_done_res[r]);
-      seqs->at(vecid).status = seq_status::FINISHED;
-      seqs->at(vecid).end_time = model_time_us();
+      seqs->at(vecid)->generated_ids = std::move(req_done_res[r]);
+      seqs->at(vecid)->status = seq_status::FINISHED;
+      seqs->at(vecid)->end_time = model_time_us();
     }
     return true;
   }
   return false;  // TODO (YZT) greedy search and top_p-top_k sampling
 }
 
-bool Model::batch_step(std::vector<sequence> *seqs, const int &n) {
+bool Model::batch_step(std::vector<shared_ptr<sequence>> *seqs, const int &n) {
   reqidx_to_vecid.clear();
   for (int ni = 0; ni < seqs->size(); ++ni) {
-    reqidx_to_vecid.emplace(seqs->at(ni).request_idx, ni);
+    reqidx_to_vecid.emplace(seqs->at(ni)->request_idx, ni);
   }
 
   std::vector<model_input> step_inputs(n);
@@ -505,35 +507,34 @@ bool Model::batch_step(std::vector<sequence> *seqs, const int &n) {
   return update_seqs(seqs, n);
 }
 
-std::vector<int> Model::batch_beam_generate() {
+std::optional<std::vector<int>> Model::batch_beam_generate() {
   if (ctx->beam_search) {
-    std::vector<sequence> seqs;
+    std::vector<shared_ptr<sequence>> seqs;
     std::vector<int>& new_generation_ids = generation_pool->get_new_generation_ids();
     int n_new_queries = new_generation_ids.size(); // used later
     seqs.reserve(n_new_queries + running_seqs.size());
     // add existing seqs
     for (const auto& seq : running_seqs) {
-      if (reqidx_to_vecid.find(seq.request_idx) == reqidx_to_vecid.end()) {
-        fprintf(stderr, "%s: error: request idx: %d not found in reqidx_to_vecid.\n", __func__, seq.request_idx);
+      if (reqidx_to_vecid.find(seq->request_idx) == reqidx_to_vecid.end()) { // reqidx_to_vecid updated in batch_step
+        fprintf(stderr, "%s: error: request idx: %d not found in reqidx_to_vecid.\n", __func__, seq->request_idx);
         exit(0);
       }
       seqs.push_back(seq);
     }
     // add new queries as sequence
     Generation *gs = generation_pool->get_generations();
-    int n_new_queries;
     for (const auto& id : new_generation_ids) {
-      seqs.push_back(Generation2Sequence(gs[id])); // generation status is set to WAITING
-      sequence& seq = seqs.back();
-      if (reqidx_to_vecid.find(seq.request_idx) != reqidx_to_vecid.end()) {
-        fprintf(stderr, "%s: error: request idx: %d already used.\n", __func__, seq.request_idx);
+      seqs.push_back(generation2Sequence(gs[id])); // generation status is set to WAITING
+      shared_ptr<sequence>& seq = seqs.back();
+      if (reqidx_to_vecid.find(seq->request_idx) != reqidx_to_vecid.end()) { // reqidx_to_vecid updated in batch_step
+        fprintf(stderr, "%s: error: request idx: %d already used.\n", __func__, seq->request_idx);
         exit(0);
       }
     }
     // clear new generation ids for next round of generation
     new_generation_ids.clear();
 
-    assert(("number of request should not be 0 and not exceed max_request_num", seqs.size() <= ctx->max_request_num && seqs.size > 0));
+    assert(("number of request should not be 0 and not exceed max_request_num", seqs.size() <= ctx->max_request_num && seqs.size() > 0));
     
     if (seqs.size() < ctx->max_request_num) { // execute one step
       batch_step(&seqs, seqs.size());
@@ -542,6 +543,7 @@ std::vector<int> Model::batch_beam_generate() {
         batch_step(&seqs, seqs.size());
       }
     }
+    std::optional<std::vector<int>> ret_vec = std::nullopt;
     // update Generations
     if (!request_done_ids.empty()) {
       std::unordered_map<int, int>& query_id_2_gen_id = generation_pool->get_query_id_2_gen_id();
@@ -554,13 +556,13 @@ std::vector<int> Model::batch_beam_generate() {
           exit(0);
         }
         const int vecid = reqidx_to_vecid[idx];
-        const int genid = query_id_2_gen_id[seqs[vecid].query_id];
+        const int genid = query_id_2_gen_id[seqs[vecid]->query_id];
         done_gen_ids.push_back(genid);
         // done_queries.emplace_back(idx, seqs[vecid].generated_ids, seqs[vecid].gen_conf.max_new_tokens);
-        Sequence2Generation(seqs[vecid], gs, genid); // copy generated tokens and reset generation
+        updateGeneration(seqs[vecid], gs, genid); // copy generated tokens and reset generation
         reqidx_to_vecid.erase(idx);
         free_req_idx[idx] = true; // release request idx and corresponding kv cache will be overwritten
-        running_seqs.erase(running_seqs.begin() + vecid - n_new_queries);
+        seqs.erase(running_seqs.begin() + vecid);
       }
       // no callback for now
       // if (response_callback) {
@@ -570,10 +572,12 @@ std::vector<int> Model::batch_beam_generate() {
       //                  [](auto &pair) { return pair.second; });
       //   response_callback(done_queries, done_queries.size());
       // }
-      return done_gen_ids;
+      ret_vec = done_gen_ids;
     }
+    running_seqs.clear();
+    std::copy(seqs.begin(), seqs.end(), std::back_inserter(running_seqs));
     // no done request
-    return {};
+    return ret_vec;
   }
   fprintf(stderr, "\nERROR: Only beam search supported for now!\n");
   exit(0);

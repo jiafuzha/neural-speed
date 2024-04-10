@@ -100,8 +100,8 @@ struct Generation {
   int64_t end_time;
   GenerationStatus status;
 
-  int32_t * prompt_ids;
-  int32_t * generated_ids;
+  int32_t * prompt_ids = nullptr;
+  int32_t * generated_ids = nullptr;
 
   Generation(int max_prompt_tokens, int global_max_new_tokens) {
     reset(GENERATION_STATUS_UNKNOWN);
@@ -117,6 +117,10 @@ struct Generation {
     receive_time = 0;
     end_time = 0;
     status = s;
+  }
+
+  void ready() {
+    status = GENERATION_STATUS_FINISHED;
   }
 
   ~Generation() {
@@ -136,8 +140,10 @@ class GenerationPool {
   }
 
   ~GenerationPool() {
-    delete[] generations;
-    generations = nullptr;
+    if (generations) {
+      delete[] generations;
+      generations = nullptr;
+    }
     query_id_2_gen_id.clear();
   }
 
@@ -155,7 +161,7 @@ class GenerationPool {
   unsigned long get_free_generation_slot_address(int query_id) {
     int index = next_free_gen_id;
     for (; index < pool_size; index++) {
-      if (generations[index].query_id == -1 || generations[index].status < GENERATION_STATUS_RUNNING) { // should be no unknown and waiting generation since these status are managed in vllm
+      if (generations[index].query_id == -1 || generations[index].status < GENERATION_STATUS_RUNNING || generations[index].status == GENERATION_STATUS_CONSUMED) { // should be no unknown and waiting generation since these status are managed in vllm
         return (unsigned long)occupy_slot(query_id, index);
       }
     }
@@ -185,8 +191,20 @@ class GenerationPool {
     query_id_2_gen_id.erase(query_id);
   }
 
+  void ready_generation_for_query(int gen_id) {
+    if (gen_id < 0 || gen_id >= pool_size) {
+      return;
+    }
+    generations[gen_id].ready();
+  }
+
   void mark_generation_done_by_query_id(int query_id) {
-    clear_generation_by_query_id(query_id, GENERATION_STATUS_FINISHED);
+    if (query_id_2_gen_id.find(query_id) == query_id_2_gen_id.end()) {
+      fprintf(stderr, "ERROR: %s, query_id %d not found in query_id_2_gen_id\n", __func__, query_id);
+      return;
+    }
+    ready_generation_for_query(query_id_2_gen_id[query_id]);
+    query_id_2_gen_id.erase(query_id);
   }
 
   int get_pool_size() {
@@ -206,12 +224,14 @@ class GenerationPool {
  private:
 
   Generation* occupy_slot(int query_id, int index) {
+    generations[index].receive_time = model_time_us();
     generations[index].query_id = query_id;
     query_id_2_gen_id[query_id] = index;
     new_generation_ids.push_back(index);
     next_free_gen_id = (index == (pool_size - 1) ? 0 : index + 1);
-    assert(("Generation not consumed", generations[index].status != GENERATION_STATUS_CONSUMED));
-    generations[index].status = GENERATION_STATUS_UNKNOWN;
+    assert(("Generation not consumed",
+    generations[index].status == GENERATION_STATUS_CONSUMED || generations[index].status == GENERATION_STATUS_UNKNOWN));
+    generations[index].status = GENERATION_STATUS_RUNNING;
     return &generations[index];
   }
 
@@ -422,7 +442,7 @@ bool Model::prepare_batch_inputs(std::vector<shared_ptr<sequence>> *seqs, const 
     if ((seqs->at(i))->status != seq_status::PREFILL && (seqs->at(i))->status != seq_status::DECODING) {
       fprintf(stderr, "%s: error: request %d status is unright (%d).\n", __func__, seqs->at(i)->request_idx,
               static_cast<int>((seqs->at(i))->status));
-      return false;
+      exit(1);
     } else if ((seqs->at(i))->status == seq_status::PREFILL) {
       inputs[i].tokens = (seqs->at(i))->prompt_ids.data();
       inputs[i].n_tokens = (seqs->at(i))->n_prompt_tokens;
@@ -519,6 +539,7 @@ std::optional<std::vector<int>> Model::batch_beam_generate() {
         fprintf(stderr, "%s: error: request idx: %d not found in reqidx_to_vecid.\n", __func__, seq->request_idx);
         exit(0);
       }
+      // seq->status = seq_status::DECODING;
       seqs.push_back(seq);
     }
     // add new queries as sequence
@@ -530,6 +551,7 @@ std::optional<std::vector<int>> Model::batch_beam_generate() {
         fprintf(stderr, "%s: error: request idx: %d already used.\n", __func__, seq->request_idx);
         exit(0);
       }
+      seq->status = seq_status::PREFILL;
     }
     // clear new generation ids for next round of generation
     new_generation_ids.clear();
@@ -545,7 +567,7 @@ std::optional<std::vector<int>> Model::batch_beam_generate() {
     }
     std::optional<std::vector<int>> ret_vec = std::nullopt;
     // update Generations
-    if (!request_done_ids.empty()) {
+    if (!request_done_ids.empty()) { // request_done_ids cleared in update_seq method
       std::unordered_map<int, int>& query_id_2_gen_id = generation_pool->get_query_id_2_gen_id();
       std::vector<int> done_gen_ids;
       done_gen_ids.reserve(request_done_ids.size());
@@ -562,7 +584,7 @@ std::optional<std::vector<int>> Model::batch_beam_generate() {
         updateGeneration(seqs[vecid], gs, genid); // copy generated tokens and reset generation
         reqidx_to_vecid.erase(idx);
         free_req_idx[idx] = true; // release request idx and corresponding kv cache will be overwritten
-        seqs.erase(running_seqs.begin() + vecid);
+        // seqs.erase(running_seqs.begin() + vecid); 
       }
       // no callback for now
       // if (response_callback) {
@@ -575,7 +597,9 @@ std::optional<std::vector<int>> Model::batch_beam_generate() {
       ret_vec = done_gen_ids;
     }
     running_seqs.clear();
-    std::copy(seqs.begin(), seqs.end(), std::back_inserter(running_seqs));
+    std::copy_if(seqs.begin(), seqs.end(), std::back_inserter(running_seqs), [](const shared_ptr<sequence>& seq) {
+      return seq->status != seq_status::FINISHED;
+    });
     // no done request
     return ret_vec;
   }

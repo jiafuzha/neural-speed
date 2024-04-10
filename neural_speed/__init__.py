@@ -289,8 +289,6 @@ class Model:
         if self.model is None or reinit_from_bin:
             self.init_from_bin(self.model_type,
                                self.bin_file,
-                               batch_size=batch_size,
-                               max_request_num=self.max_request_num,
                                **generate_kwargs)
             self.generate_round = 0
         elif not interactive:
@@ -400,6 +398,9 @@ class ModelForContBatching:
         n_batch:int = 512,
         batch_size:int = 512,
         max_batched_tokens:int = 512,
+        max_request_num:int = 512,
+        max_new_tokens:int = 512,
+        min_new_tokens:int = 1,
         threads:int = 56,
         repetition_penalty:float = 1.1,
         num_beams:int = 4, # need to be greater than 1 for now since only beam search is supported
@@ -414,14 +415,14 @@ class ModelForContBatching:
         shift_roped_k:bool = False,
         pad_token:int = -1,
         memory_dtype:str = "auto", # auto, fp16, fp32
-        scratch_size_ratio:float = None,
+        scratch_size_ratio:float = 1.0,
         seed:int = 1234
     ):
         self.generation_args = {}
-        self.generation_args["ctx_size"] = ctx_size
+        self.generation_args["max_new_tokens"] = max_new_tokens
         self.generation_args["n_batch"] = n_batch
-        self.generation_args["batch_size"] = batch_size
-        self.generation_args["max_batched_tokens"] = max_batched_tokens
+        self.generation_args["ctx_size"] = ctx_size
+        self.generation_args["seed"] = seed
         self.generation_args["threads"] = threads
         self.generation_args["repetition_penalty"] = repetition_penalty
         self.generation_args["num_beams"] = num_beams
@@ -429,15 +430,19 @@ class ModelForContBatching:
         self.generation_args["top_k"] = top_k
         self.generation_args["top_p"] = top_p
         self.generation_args["temperature"] = temperature
+        self.generation_args["min_new_tokens"] = min_new_tokens
         self.generation_args["length_penalty"] = length_penalty
         self.generation_args["early_stopping"] = early_stopping
         self.generation_args["n_keep"] = n_keep
         self.generation_args["n_discard"] = n_discard
         self.generation_args["shift_roped_k"] = shift_roped_k
+        self.generation_args["batch_size"] = batch_size
+        self.generation_args["max_batched_tokens"] = max_batched_tokens
         self.generation_args["pad_token"] = pad_token
         self.generation_args["memory_dtype"] = memory_dtype
+        self.generation_args["continuous_batching"] = True
+        self.generation_args["max_request_num"] = max_request_num
         self.generation_args["scratch_size_ratio"] = scratch_size_ratio
-        self.generation_args["seed"] = seed
 
         self.model_wrapper = Model()
         self.model_type = None
@@ -494,6 +499,12 @@ class ModelForContBatching:
         self.model_wrapper.init_from_bin(self.model_type,
                             self.model_wrapper.bin_file,
                             **self.generation_args)
+        
+    def get_generations_address(self) -> int:
+        return self.model_wrapper.model.get_generations_address()
+    
+    def get_free_generation_slot_address(self, query_id: int) -> int:
+        return self.model_wrapper.model.get_free_generation_slot_address(query_id)
 
     def __call__(self):
         return self.model_wrapper.model.batch_beam_generate()

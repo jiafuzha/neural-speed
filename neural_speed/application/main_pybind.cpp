@@ -59,17 +59,15 @@ namespace {
 struct Query {
   uint64_t id;
   std::vector<model_vocab::id> token_ids;
-  uint64_t max_new_tokens;
   Query() {}
-  Query(uint64_t id, const pybind11::array_t<model_vocab::id, py::array::c_style | py::array::forcecast>& token_ids, uint64_t max_new_tokens)
-      : id(id), token_ids(token_ids.data(), token_ids.data() + token_ids.size()), max_new_tokens(max_new_tokens) {
+  Query(uint64_t id, const pybind11::array_t<model_vocab::id, py::array::c_style | py::array::forcecast>& token_ids)
+      : id(id), token_ids(token_ids.data(), token_ids.data() + token_ids.size()) {
     assert(token_ids.ndim() == 1 || (token_ids.ndim() == 2 && token_ids.shape(0) == 1));
-    assert(max_new_tokens > 0);
   }
 
   std::string to_string() const {
     const std::string repr_ids(py::str(py::array_t<int, py::array::c_style>(token_ids.size(), token_ids.data())));
-    return std::to_string(id) + ": " + repr_ids + ": " + std::to_string(max_new_tokens);
+    return std::to_string(id) + ": " + repr_ids;
   }
 };
 // Response happens to be the same structure as Query, while the tokens IDs is for prompt in a Query but is for
@@ -249,7 +247,7 @@ class ModelServer {
     ret_seq.n_tokens = query.token_ids.size();
     ret_seq.n_past = 0;
     ret_seq.n_total = 0;
-    ret_seq.gen_conf.max_new_tokens = query.max_new_tokens;
+    ret_seq.gen_conf.max_new_tokens = params.n_predict;
     ret_seq.gen_conf.min_new_tokens = params.min_new_tokens;
     ret_seq.gen_conf.length_penalty = params.length_penalty;
     ret_seq.gen_conf.do_early_stopping = params.do_early_stopping;
@@ -929,11 +927,10 @@ PYBIND11_MODULE(gemma_cpp, m)
       .def("get_eos_id", &Model::get_eos_id)
       .def("reinit", &Model::reinit);
   py::class_<Query>(m, "Query")
-      .def(py::init<uint64_t, py::array_t<model_vocab::id>, uint16_t>())
+      .def(py::init<uint64_t, py::array_t<model_vocab::id>>())
       .def("__repr__", &Query::to_string)
       .def_readwrite("id", &Query::id)
-      .def_readwrite("token_ids", &Query::token_ids)
-      .def_readwrite("max_new_tokens", &Query::max_new_tokens);
+      .def_readwrite("token_ids", &Query::token_ids);
   py::class_<ModelServer>(m, "ModelServer", py::module_local())
       .def(py::init<const ResponseCallback&, const std::string&, bool, int, int, int, int, int, float, int, bool, int,
                     float, float, int, float, bool, int, int, bool, int, model_vocab::id, const std::string&, bool,

@@ -553,7 +553,7 @@ class ModelForContBatching:
              model_hub="huggingface"):
         from transformers import AutoConfig
         self.config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-        self.model_type = Model.get_model_type(self.config)
+        self.model_type = _get_model_type(self.config)
         self.__import_package__(self.model_type)
         self.model_wrapper.init(model_name,
                         use_quant=use_quant,

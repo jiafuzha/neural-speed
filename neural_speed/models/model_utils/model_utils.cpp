@@ -127,10 +127,12 @@ static bool kv_cache_init(const struct model_hparams& hparams, struct model_kv_c
     fprintf(stderr, "%s: run_mha_reordered = %d\n", __func__, run_mha_reordered);
   } else {
     cache.k = ne_new_tensor_1d(cache.ctx, wtype_alloc, n_layer * layer_ne_k + NE_ALIGNMENT, NE_SIZE_CALC);
+    ne_set_name(cache.k, "cache_k raw");
     const auto k_align_off = reinterpret_cast<uintptr_t>(cache.k->data) % NE_ALIGNMENT;
     cache.k = ne_view_1d(cache.ctx, cache.k, n_layer * layer_ne_k, NE_ALIGNMENT - k_align_off);
     cache.k->type = wtype;
     cache.v = ne_new_tensor_1d(cache.ctx, wtype_alloc, n_layer * layer_ne_v + NE_ALIGNMENT, NE_SIZE_CALC);
+    ne_set_name(cache.v, "cache_v raw");
     const auto v_align_off = reinterpret_cast<uintptr_t>(cache.v->data) % NE_ALIGNMENT;
     cache.v = ne_view_1d(cache.ctx, cache.v, n_layer * layer_ne_v, NE_ALIGNMENT - v_align_off);
     cache.v->type = wtype;

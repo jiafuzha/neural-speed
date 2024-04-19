@@ -507,6 +507,8 @@ NE_API void ne_graph_profiling(const struct ne_cgraph* cgraph);
 // dump the graph into a file using the dot format
 NE_API void ne_graph_dump_dot(const struct ne_cgraph* gb, const struct ne_cgraph* gf, const char* filename);
 
+NE_API void ggml_graph_export(const struct ne_cgraph * cgraph, const char * fname);
+
 //
 // optimization
 //

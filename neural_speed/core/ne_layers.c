@@ -579,7 +579,9 @@ int ne_nrows(const struct ne_tensor* tensor) {
 
 size_t ne_nbytes(const struct ne_tensor* tensor) {
   static_assert(NE_MAX_DIMS == 4, "NE_MAX_DIMS is not 4 - update this function");
-
+  if (tensor->type == NE_TYPE_BTLA) {
+    return (ne_nelements(tensor) * 1);
+  }
   return (ne_nelements(tensor) * NE_TYPE_SIZE[tensor->type]) / NE_BLCK_SIZE[tensor->type];
 }
 
@@ -1283,6 +1285,7 @@ const char* ne_get_name(const struct ne_tensor* tensor) { return tensor->name; }
 void ne_set_name(struct ne_tensor* tensor, const char* name) {
   // Ensure that there is space for the null terminator
   size_t name_len = sizeof(tensor->name) - 1;
+  name_len = MIN(name_len, strlen(name));
   // Copy up to name_len characters from 'name' to 'tensor->name'
   strncpy(tensor->name, name, name_len);
   // Explicitly set the last character to the null terminator
@@ -11771,6 +11774,231 @@ void ne_graph_dump_dot(const struct ne_cgraph* gb, const struct ne_cgraph* gf, c
   fclose(fp);
 
   NE_PRINT("%s: dot -Tpng %s -o %s.png && open %s.png\n", __func__, filename, filename, filename);
+}
+
+
+static void ggml_graph_export_leaf(const struct ne_tensor * tensor, FILE * fout) {
+    const int64_t * ne = tensor->ne;
+    const size_t  * nb = tensor->nb;
+
+    fprintf(fout, "%-6s %-12s %8d %8ld %8ld %8ld %8ld %16zu %16zu %16zu %16zu %16p %32s\n",
+            ne_type_name(tensor->type),
+            tensor->op,
+            tensor->n_dims,
+            ne[0], ne[1], ne[2], ne[3],
+            nb[0], nb[1], nb[2], nb[3],
+            tensor->data,
+            tensor->name);
+}
+
+static void ggml_graph_export_node(const struct ne_tensor * tensor, const char * arg, FILE * fout) {
+    const int64_t * ne = tensor->ne;
+    const size_t  * nb = tensor->nb;
+
+    fprintf(fout, "%-6s %-6s %-12s %8d %8ld %8ld %8ld %8ld %16zu %16zu %16zu %16zu %16p %32s\n",
+            arg,
+            ne_type_name(tensor->type),
+            NE_OP_LABEL[tensor->op],
+            tensor->n_dims,
+            ne[0], ne[1], ne[2], ne[3],
+            nb[0], nb[1], nb[2], nb[3],
+            tensor->data,
+            tensor->name);
+}
+
+void ggml_graph_export(const struct ne_cgraph * cgraph, const char * fname) {
+    uint64_t size_eval = 0;
+    #define NE_MAX_SRC 10
+    #define GGML_MAX_NAME           64
+#define GGML_MAX_OP_PARAMS      64
+    // compute size of intermediate results
+    // TODO: does not take into account scratch buffers !!!!
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        size_eval += ne_nbytes(cgraph->nodes[i]);
+    }
+
+    // print
+    {
+        FILE * fout = stdout;
+
+        fprintf(fout, "\n");
+        fprintf(fout, "%-16s %8x\n", "magic",        0);
+        fprintf(fout, "%-16s %8d\n", "version",      0);
+        fprintf(fout, "%-16s %8d\n", "leafs",        cgraph->n_leafs);
+        fprintf(fout, "%-16s %8d\n", "nodes",        cgraph->n_nodes);
+        fprintf(fout, "%-16s %" PRIu64 "\n", "eval", size_eval);
+
+        // header
+        fprintf(fout, "\n");
+        fprintf(fout, "%-6s %-12s %8s %8s %8s %8s %8s %16s %16s %16s %16s %16s %16s\n",
+                "TYPE", "OP", "NDIMS", "NE0", "NE1", "NE2", "NE3", "NB0", "NB1", "NB2", "NB3", "DATA", "NAME");
+
+        for (int i = 0; i < cgraph->n_leafs; ++i) {
+            ggml_graph_export_leaf(cgraph->leafs[i], fout);
+
+            NE_ASSERT(cgraph->leafs[i]->op   == NE_OP_NONE);
+            NE_ASSERT(cgraph->leafs[i]->src0 == NULL);
+            NE_ASSERT(cgraph->leafs[i]->src1 == NULL);
+        }
+
+        // header
+        fprintf(fout, "\n");
+        fprintf(fout, "%-6s %-6s %-12s %8s %8s %8s %8s %8s %16s %16s %16s %16s %8s %16s %16s\n",
+                "ARG", "TYPE", "OP", "NDIMS", "NE0", "NE1", "NE2", "NE3", "NB0", "NB1", "NB2", "NB3", "NTASKS", "DATA", "NAME");
+
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_graph_export_node(cgraph->nodes[i], "DST", fout);
+
+            if (cgraph->nodes[i]->src0) {
+                    ggml_graph_export_node(cgraph->nodes[i]->src0, "SRC", fout);
+            }
+            if (cgraph->nodes[i]->src1) {
+                ggml_graph_export_node(cgraph->nodes[i]->src1, "SRC", fout);
+            }
+
+            for (int j = 0; j < NE_MAX_OPT; ++j) {
+                if (cgraph->nodes[i]->opt[j]) {
+                    ggml_graph_export_node(cgraph->nodes[i]->opt[j], "OPT", fout);
+                }
+            }
+
+            fprintf(fout, "\n");
+        }
+
+        fprintf(fout, "\n");
+    }
+
+    // write binary data
+    {
+        FILE * fout = fopen(fname, "w");
+
+        if (!fout) {
+            fprintf(stderr, "%s: failed to open %s\n", __func__, fname);
+            return;
+        }
+
+        // header
+        {
+            const uint32_t magic   = 0;
+            const uint32_t version = 0;
+            const uint32_t n_leafs = cgraph->n_leafs;
+            const uint32_t n_nodes = cgraph->n_nodes;
+
+            fwrite(&magic,     sizeof(uint32_t), 1, fout);
+            fwrite(&version,   sizeof(uint32_t), 1, fout);
+            fwrite(&n_leafs,   sizeof(uint32_t), 1, fout);
+            fwrite(&n_nodes,   sizeof(uint32_t), 1, fout);
+            fwrite(&size_eval, sizeof(uint64_t), 1, fout);
+        }
+
+        // leafs
+        {
+            for (int i = 0; i < cgraph->n_leafs; ++i) {
+                const struct ne_tensor * tensor = cgraph->leafs[i];
+
+                const uint32_t type   = tensor->type;
+                const uint32_t op     = tensor->op;
+
+                fwrite(&type,   sizeof(uint32_t), 1, fout);
+                fwrite(&op,     sizeof(uint32_t), 1, fout);
+
+                for (int j = 0; j < NE_MAX_DIMS; ++j) {
+                    const uint64_t ne = tensor->ne[j];
+                    const uint64_t nb = tensor->nb[j];
+
+                    fwrite(&ne, sizeof(uint64_t), 1, fout);
+                    fwrite(&nb, sizeof(uint64_t), 1, fout);
+                }
+
+                fwrite(tensor->name,      sizeof(char), GGML_MAX_NAME,      fout);
+                fwrite(tensor->op_params, sizeof(char), GGML_MAX_OP_PARAMS, fout);
+
+                // dump the data
+                // TODO: pad this to 32 byte boundary
+                {
+                    const size_t size = ne_nbytes(tensor);
+
+                    fwrite(tensor->data, sizeof(char), size, fout);
+                }
+            }
+        }
+
+        // nodes
+        {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const struct ne_tensor * tensor = cgraph->nodes[i];
+
+                const uint32_t type   = tensor->type;
+                const uint32_t op     = tensor->op;
+
+                fwrite(&type,   sizeof(uint32_t), 1, fout);
+                fwrite(&op,     sizeof(uint32_t), 1, fout);
+
+                for (int j = 0; j < NE_MAX_DIMS; ++j) {
+                    const uint64_t ne = tensor->ne[j];
+                    const uint64_t nb = tensor->nb[j];
+
+                    fwrite(&ne, sizeof(uint64_t), 1, fout);
+                    fwrite(&nb, sizeof(uint64_t), 1, fout);
+                }
+
+                fwrite(tensor->name,      sizeof(char), GGML_MAX_NAME,      fout);
+                fwrite(tensor->op_params, sizeof(char), GGML_MAX_OP_PARAMS, fout);
+
+                // output the op arguments
+                {
+                    struct ne_tensor * args[NE_MAX_SRC] = { NULL };
+
+                    
+                    args[0] = tensor->src0;
+                    args[1] = tensor->src1;
+                    for (int j = 2; j < NE_MAX_SRC; ++j) {
+                        args[j] = tensor->opt[j];
+                    }
+
+                    for (int j = 0; j < NE_MAX_SRC; ++j) {
+                        if (args[j]) {
+                            int32_t idx = -1;
+
+                            // check if leaf
+                            {
+                                for (int k = 0; k < cgraph->n_leafs; ++k) {
+                                    if (args[j] == cgraph->leafs[k]) {
+                                        idx = k;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // check if node
+                            if (idx == -1) {
+                                for (int k = 0; k < cgraph->n_nodes; ++k) {
+                                    if (args[j] == cgraph->nodes[k]) {
+                                        idx = cgraph->n_leafs + k;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (idx == -1) {
+                                fprintf(stderr, "%s: failed to find tensor, arg = %d, node = %d\n", __func__, j, i);
+                                fclose(fout);
+                                return;
+                            }
+
+                            fwrite(&idx, sizeof(int32_t), 1, fout);
+                        } else {
+                            const int32_t nul = -1;
+
+                            fwrite(&nul, sizeof(int32_t), 1, fout);
+                        }
+                    }
+                }
+            }
+        }
+
+        fclose(fout);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
